@@ -14,24 +14,33 @@ import {
   miscUtils,
   DescriptorHash,
 } from '@yarnpkg/core';
-// import { PortablePath, xfs, NoFS, JailFS } from '@yarnpkg/fslib';
+import { PortablePath, ppath, xfs, JailFS } from '@yarnpkg/fslib';
 import { parseResolution, Resolution } from '@yarnpkg/parsers';
 
 const PROTOCOL = `ignoreDeps:`;
+
+const VERSION = '1'
+
+type Mode = 'depsOf' | 'self';
+
+function getMode(range: string): Mode {
+  const { selector } = structUtils.parseRange(range);
+  return selector === 'self' ? 'self' : 'depsOf';
+}
 
 function getOriginalDescriptor(desc: Descriptor) {
   const { source } = structUtils.parseRange(desc.range);
   return structUtils.parseDescriptor(source);
 }
 
-function addProtocolToDescriptor(desc: Descriptor) {
+function addProtocolToDescriptor(desc: Descriptor, mode: Mode = 'depsOf') {
   return structUtils.makeDescriptor(
     desc,
     structUtils.makeRange({
       protocol: PROTOCOL,
       source: structUtils.stringifyDescriptor(desc),
-      selector: '',
-      params: null,
+      selector: mode,
+      params: { version: VERSION },
     }),
   );
 }
@@ -41,14 +50,14 @@ function getOriginalLocator(loc: Locator) {
   return structUtils.parseLocator(source);
 }
 
-function addProtocolToLocator(loc: Locator) {
+function addProtocolToLocator(loc: Locator, mode: Mode = 'depsOf') {
   return structUtils.makeLocator(
     loc,
     structUtils.makeRange({
       protocol: PROTOCOL,
       source: structUtils.stringifyLocator(loc),
-      selector: '',
-      params: null,
+      selector: mode,
+      params: { version: VERSION },
     }),
   );
 }
@@ -76,9 +85,11 @@ class IgnoreDepsResolver implements Resolver {
     fromLocator: Locator,
     opts: MinimalResolveOptions,
   ) {
+    const mode = getMode(_descriptor.range);
     const descriptor = getOriginalDescriptor(_descriptor);
     return addProtocolToDescriptor(
       opts.resolver.bindDescriptor(descriptor, fromLocator, opts),
+      mode,
     );
   }
 
@@ -93,20 +104,29 @@ class IgnoreDepsResolver implements Resolver {
 
   async getCandidates(
     _descriptor: Descriptor,
-    dependencies: Record<string, Package>, opts: ResolveOptions
+    dependencies: Record<string, Package>,
+    opts: ResolveOptions,
   ) {
+    const mode = getMode(_descriptor.range);
     const descriptor = getOriginalDescriptor(_descriptor);
     return (
       await opts.resolver.getCandidates(descriptor, dependencies, opts)
-    ).map(addProtocolToLocator);
+    ).map((loc) => addProtocolToLocator(loc, mode));
   }
 
   async getSatisfying(
     _descriptor: Descriptor,
-    dependencies: Record<string, Package>, locators: Array<Locator>, opts: ResolveOptions
+    dependencies: Record<string, Package>,
+    locators: Array<Locator>,
+    opts: ResolveOptions,
   ) {
     const descriptor = getOriginalDescriptor(_descriptor);
-    return opts.resolver.getSatisfying(descriptor, dependencies, locators, opts);
+    return opts.resolver.getSatisfying(
+      descriptor,
+      dependencies,
+      locators,
+      opts,
+    );
   }
 
   async resolve(_locator: Locator, opts: ResolveOptions): Promise<Package> {
@@ -129,17 +149,33 @@ class IgnoreDepsFetcher implements Fetcher {
   }
 
   getLocalPath(locator: Locator, opts: FetchOptions) {
+    if (getMode(locator.reference) === 'self') return null;
     return opts.fetcher.getLocalPath(getOriginalLocator(locator), opts);
   }
 
   async fetch(locator: Locator, opts: FetchOptions) {
+    if (getMode(locator.reference) === 'self') {
+      const pkg = opts.project.storedPackages.get(locator.locatorHash);
+      if (!pkg) {
+        throw new Error(
+          `Package ${structUtils.stringifyIdent(locator)} not found in the project (yarn-plugin-ignore-deps)`,
+        );
+      }
+      const tempDir = await xfs.mktempPromise();
+      await xfs.writeJsonPromise(
+        ppath.join(tempDir, 'package.json' as PortablePath),
+        {
+          name: structUtils.stringifyIdent(pkg),
+          version: pkg.version,
+          __info: 'mocked by yarn-plugin-ignore-deps',
+        },
+      );
+      return {
+        packageFs: new JailFS(tempDir),
+        prefixPath: PortablePath.dot,
+      };
+    }
     return opts.fetcher.fetch(getOriginalLocator(locator), opts);
-    // const tempDir = await xfs.mktempPromise();
-    // const p = tempDir as PortablePath;
-    // return {
-    //   packageFs: new JailFS(p),
-    //   prefixPath: PortablePath.dot,
-    // };
   }
 }
 
@@ -178,15 +214,25 @@ const hooks: Hooks = {
     initialDependency,
     extra,
   ) {
+    const ignoreDeps = memo(
+      project.configuration.get('ignoreDependencies').get('deps'),
+      (deps) => deps.map(parseResolution),
+    );
+
+    for (const pattern of ignoreDeps) {
+      if (isMatched(pattern, dependency, locator)) {
+        return addProtocolToDescriptor(dependency, 'self');
+      }
+    }
+
     const ignoreDepsOf = memo(
       project.configuration.get('ignoreDependencies').get('depsOf'),
       (deps) => deps.map(parseResolution),
     );
 
     for (const pattern of ignoreDepsOf) {
-      // https://github.com/yarnpkg/berry/blob/bdd107579b76a71970a61c2cce46a5d4b51ca596/packages/yarnpkg-core/sources/CorePlugin.ts#L17
       if (isMatched(pattern, dependency, locator)) {
-        return addProtocolToDescriptor(dependency);
+        return addProtocolToDescriptor(dependency, 'depsOf');
       }
     }
     return dependency;
@@ -197,6 +243,7 @@ declare module '@yarnpkg/core' {
   interface ConfigurationValueMap {
     ignoreDependencies: miscUtils.ToMapValue<{
       depsOf: Array<string>;
+      deps: Array<string>;
     }>;
   }
 }
@@ -208,6 +255,12 @@ const plugin: Plugin = {
       description: 'Ignore packages',
       properties: {
         depsOf: {
+          description: ``,
+          default: [],
+          isArray: true,
+          type: SettingsType.STRING,
+        },
+        deps: {
           description: ``,
           default: [],
           isArray: true,
