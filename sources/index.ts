@@ -1,3 +1,4 @@
+import type { Cache } from '@yarnpkg/core';
 import {
   Hooks,
   Plugin,
@@ -134,7 +135,8 @@ class IgnoreDepsResolver implements Resolver {
     const sourcePkg = await opts.resolver.resolve(locator, opts);
     return {
       ...sourcePkg,
-      ..._locator,
+      locatorHash: _locator.locatorHash,
+      reference: _locator.reference,
       peerDependencies: new Map(),
       dependencies: new Map(),
     };
@@ -175,7 +177,40 @@ class IgnoreDepsFetcher implements Fetcher {
         prefixPath: PortablePath.dot,
       };
     }
-    return opts.fetcher.fetch(getOriginalLocator(locator), opts);
+    const outerLocator = locator;
+    const innerLocator = getOriginalLocator(locator);
+    const outerChecksum =
+      opts.checksums.get(outerLocator.locatorHash) ?? null;
+    const report = new Proxy(opts.report, {
+      get(target, prop, receiver) {
+        if (prop === 'reportCacheHit') {
+          return () => target.reportCacheHit(outerLocator);
+        }
+        if (prop === 'reportCacheMiss') {
+          return (_loc: Locator, message?: string) =>
+            target.reportCacheMiss(outerLocator, message);
+        }
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    const cache = new Proxy(opts.cache, {
+      get(target, prop, receiver) {
+        if (prop === 'fetchPackageFromCache') {
+          const fn = Reflect.get(target, prop, receiver) as Cache['fetchPackageFromCache'];
+          return (
+            loc: Locator,
+            checksum: string | null,
+            options: Parameters<Cache['fetchPackageFromCache']>[2],
+          ) =>
+            loc.locatorHash === innerLocator.locatorHash
+              ? fn.call(target, outerLocator, outerChecksum, options)
+              : fn.call(target, loc, checksum, options);
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    return opts.fetcher.fetch(innerLocator, { ...opts, cache, report });
   }
 }
 
